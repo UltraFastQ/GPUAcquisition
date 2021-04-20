@@ -46,6 +46,9 @@ public:
 	/* Returns true if the acquisition is complete */
 	bool is_finished();
 
+    /* Stops the acquisition of data */
+    void stop();
+
 private:
 	/* Allocates the necessary data on the CPU and GPU */
 	void alloc_mem();
