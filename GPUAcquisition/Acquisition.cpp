@@ -807,6 +807,11 @@ bool Acquisition::is_finished() {
 	return should_stop_acq;
 }
 
+void Acquisition::stop() {
+    std::unique_lock lock(should_stop_acq_mutex);
+    should_stop_acq = true;
+}
+
 Acquisition::~Acquisition() {
 	try {
 		cleanup();

@@ -241,6 +241,9 @@ PYBIND11_MODULE(GPUAcquisition, m) {
         )
         .def("is_finished", &Acquisition::is_finished, ""
             "TODO: Documentation"
+        )
+        .def("stop", &Acquisition::stop, ""
+            "TODO: Documentation"
         );
     // TODO: __enter__ and __exit__ for context manager
 
