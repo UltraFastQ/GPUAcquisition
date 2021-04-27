@@ -104,11 +104,6 @@ void Acquisition::configure_devices(AcquisitionConfig* config) {
 	rc = ATS_GPU_SetCUDAComputeDevice(m_alazar_board, m_gpu_device_id);
 	utils::alazar_err_handle(rc, "ATS_GPU_SetCUDADevice failed", __FILE__, __LINE__);
 
-	// GPU Setup
-	uint32_t samples_per_record_per_channel = m_config.acquisition_setup.pre_trigger_samples + m_config.acquisition_setup.post_trigger_samples;
-	rc = ATS_GPU_Setup(m_alazar_board, m_config.acquisition_setup.channels, m_config.acquisition_setup.transfer_offset, samples_per_record_per_channel, m_config.acquisition_setup.records_per_buffer, m_config.acquisition_setup.records_per_acquisition, m_config.acquisition_setup.adma_flags, m_config.acquisition_setup.gpu_flags);
-	utils::alazar_err_handle(rc, "ATS_GPU_Setup failed", __FILE__, __LINE__);
-
 	// Number of channels enabled on the Alazar board
 	m_num_channels = 0;
 	long channels_per_board = 0;
@@ -120,7 +115,7 @@ void Acquisition::configure_devices(AcquisitionConfig* config) {
 			++m_num_channels;
 		}
 	}
-
+	uint32_t samples_per_record_per_channel = m_config.acquisition_setup.pre_trigger_samples + m_config.acquisition_setup.post_trigger_samples;
 	m_samples_per_buffer = samples_per_record_per_channel * m_config.acquisition_setup.records_per_buffer;
 
 	// Information about how the data is stored on the card
@@ -133,17 +128,17 @@ void Acquisition::configure_devices(AcquisitionConfig* config) {
 	if (!(m_config.acquisition_setup.gpu_flags & ATS_GPU_SETUP_FLAG::ATS_GPU_SETUP_FLAG_UNPACK)) {
 		// If we have to unpack the data on our own, we have to figure out the number of bytes per sample
 		switch (m_config.pack_mode) {
-			case PACK_8_BITS_PER_SAMPLE:
-				bytes_per_sample = 1.0;
-				break;
-			case PACK_12_BITS_PER_SAMPLE:
-				bytes_per_sample = 1.5; // 12 bits = 1.5 bytes
-				break;
-			case PACK_DEFAULT:
-				// FIXME: The default on all boards isn't 8 bits
-			default:
-				bytes_per_sample = 1.0;
-				break;
+		case PACK_8_BITS_PER_SAMPLE:
+			bytes_per_sample = 1.0;
+			break;
+		case PACK_12_BITS_PER_SAMPLE:
+			bytes_per_sample = 1.5; // 12 bits = 1.5 bytes
+			break;
+		case PACK_DEFAULT:
+			// FIXME: The default on all boards isn't 8 bits
+		default:
+			bytes_per_sample = 1.0;
+			break;
 		}
 	}
 	else {
@@ -151,6 +146,14 @@ void Acquisition::configure_devices(AcquisitionConfig* config) {
 		bytes_per_sample = static_cast<double>(((bits_per_sample + 7) / 8));
 	}
 	m_bytes_per_buffer = static_cast<uint32_t>(m_samples_per_buffer * bytes_per_sample);
+
+	// Record size
+	rc = AlazarSetRecordSize(m_alazar_board, m_config.acquisition_setup.pre_trigger_samples, m_config.acquisition_setup.post_trigger_samples);
+	utils::alazar_err_handle(rc, "AlazarSetRecordSize failed", __FILE__, __LINE__);
+
+	// GPU and Alazar card setup
+	rc = ATS_GPU_Setup(m_alazar_board, m_config.acquisition_setup.channels, m_config.acquisition_setup.transfer_offset, samples_per_record_per_channel, m_config.acquisition_setup.records_per_buffer, m_config.acquisition_setup.records_per_acquisition, m_config.acquisition_setup.adma_flags, m_config.acquisition_setup.gpu_flags);
+	utils::alazar_err_handle(rc, "ATS_GPU_Setup failed", __FILE__, __LINE__);
 }
 
 void Acquisition::set_ops(std::vector<OpPtr>& ops_chan_a, std::vector<OpPtr>& ops_chan_b) {
@@ -277,8 +280,14 @@ void Acquisition::alloc_mem() {
 	m_streams = std::vector<cudaStream_t>(m_config.num_gpu_buffers, nullptr);
 
 	// File I/O
-	if (m_config.data_writing.fname != "" && m_config.data_writing.num_buffs_to_write > 0) {
-		m_out_file = std::ofstream(m_config.data_writing.fname, std::ios::out | std::ios::app | std::ios::binary);
+	if (m_config.data_writing.fname != "") {
+		// Only open files if the associated channels are enabled
+		if (m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_A) {
+			m_out_file_chan_a = std::ofstream(m_config.data_writing.fname + "_chan_a", std::ios::out | std::ios::app | std::ios::binary);
+		}
+		if (m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_B) {
+			m_out_file_chan_b = std::ofstream(m_config.data_writing.fname + "_chan_b", std::ios::out | std::ios::app | std::ios::binary);
+		}
 	}
 	
 	// We need to allocate space on the GPU to receive the data from the Alazar card
@@ -430,7 +439,7 @@ void Acquisition::buffer_handler() {
 	size_t buffers_full = 0; // The number of buffers this thread fills
 	constexpr const uint32_t buffer_timeout_ms = 10000; // Timeout should be longer than the time required to capture all the data (TODO: Make this a prviate variable)
 
-	utils::log_message(std::string("Capturing data from ") + std::to_string(m_config.num_gpu_buffers) + " buffers");
+	// utils::log_message(std::string("Capturing data from ") + std::to_string(m_config.num_gpu_buffers) + " buffers");
 
 	// Tell the Alazar card to start capturing data
 	RETURN_CODE rc = ATS_GPU_StartCapture(m_alazar_board);
@@ -473,7 +482,18 @@ void Acquisition::buffer_handler() {
 		timers_start[1] = std::chrono::steady_clock::now();
 		// Separate the raw data into their separate streams
 		UnpackOp unpack(static_cast<size_t>(m_bytes_per_buffer) * static_cast<size_t>(m_num_channels));
-		unpack.operate(m_raw_buffers[buff_idx], m_chan_a_real_buffers[buff_idx], m_chan_b_real_buffers[buff_idx]);
+		if (m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_A && m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_B) {
+			unpack.operate(m_raw_buffers[buff_idx], m_chan_a_real_buffers[buff_idx], m_chan_b_real_buffers[buff_idx]);
+		}
+		else if (m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_A) {
+			unpack.operate(m_raw_buffers[buff_idx], m_chan_a_real_buffers[buff_idx], nullptr);
+		}
+		else if (m_config.acquisition_setup.channels & ALAZAR_CHANNELS::CHANNEL_B) {
+			unpack.operate(m_raw_buffers[buff_idx], m_chan_b_real_buffers[buff_idx], nullptr);
+		}
+		else {
+			utils::log_error("Neither channels A nor B are setup for acquisition", __FILE__, __LINE__);
+		}
 
 		auto cuda_rc = cudaStreamSynchronize(0); // default stream is stream 0
 		utils::cuda_err_handle(cuda_rc, "cudaStreamSynchronize failed", __FILE__, __LINE__);
@@ -539,17 +559,19 @@ void Acquisition::buffer_handler() {
 		times[2] = ((times[2] * (buffers_full - 1)) + static_cast<float>(std::chrono::duration_cast<std::chrono::microseconds>(timers_stop[2] - timers_start[2]).count())) / static_cast<float>(buffers_full);
 
 		if (buffers_full % 500 == 0) {
-			utils::log_message(std::string("Processed buffer ") + std::to_string(buffers_full));
+			// utils::log_message(std::string("Processed buffer ") + std::to_string(buffers_full));
 		}
 		
 		// Save data to disk if we need to
-		//if (buffers_full <= m_config.data_writing.num_buffs_to_write && m_out_file.is_open()) {
-		if (m_out_file.is_open()) {
+		if (m_out_file_chan_a.is_open()) {
 			cuda_rc = cudaMemcpy(m_cpu_chan_a_real_buffers[buff_idx], m_chan_a_real_buffers[buff_idx], m_samples_per_buffer * sizeof(cufftReal), cudaMemcpyDeviceToHost);
-			//cuda_rc = cudaMemcpy(raw_buffers_cpu[buff_idx], m_raw_buffers[buff_idx], m_bytes_per_buffer * m_num_channels, cudaMemcpyDeviceToHost);
 			utils::cuda_err_handle(cuda_rc, "cudaMemcpy failed", __FILE__, __LINE__);
-			// utils::log_message("Writing data to disk");
-			m_out_file.write(reinterpret_cast<char*>(&m_cpu_chan_a_real_buffers[buff_idx][0]), m_samples_per_buffer * sizeof(cufftReal));
+			m_out_file_chan_a.write(reinterpret_cast<char*>(&m_cpu_chan_a_real_buffers[buff_idx][0]), m_samples_per_buffer * sizeof(cufftReal));
+		}
+		if (m_out_file_chan_b.is_open()) {
+			cuda_rc = cudaMemcpy(m_cpu_chan_b_real_buffers[buff_idx], m_chan_b_real_buffers[buff_idx], m_samples_per_buffer * sizeof(cufftReal), cudaMemcpyDeviceToHost);
+			utils::cuda_err_handle(cuda_rc, "cudaMemcpy failed", __FILE__, __LINE__);
+			m_out_file_chan_b.write(reinterpret_cast<char*>(&m_cpu_chan_b_real_buffers[buff_idx][0]), m_samples_per_buffer * sizeof(cufftReal));
 		}
 
 		// Post this buffer back to the Alazar board so that it can be reused for a future data acquisition
@@ -564,7 +586,8 @@ void Acquisition::buffer_handler() {
 
 		auto time_end = std::chrono::steady_clock::now();
 		auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
-		if (time_ms >= 5000) break; // stop after 5 seconds
+		// if (time_ms >= 5000) break; // stop after 5 seconds
+		if (m_config.data_writing.num_buffs_to_write && time_ms >= m_config.data_writing.num_buffs_to_write) break;
 		// if (m_config.data_writing.num_buffs_to_write && buffers_full >= m_config.data_writing.num_buffs_to_write) break;
 		// if (buffers_full == 1010) break;
 		// break;
@@ -583,18 +606,18 @@ void Acquisition::buffer_handler() {
 	auto time_end = std::chrono::steady_clock::now();
 	auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
 	float acq_size = static_cast<float>(buffers_full * static_cast<size_t>(m_bytes_per_buffer) * static_cast<size_t>(m_num_channels)) / (static_cast<float>(1 << 30));
-	utils::log_message(std::string("Buffers filled: ") + std::to_string(buffers_full));
-	utils::log_message(std::string("Acquisition time: ") + std::to_string(time_ms) + " ms");
-	utils::log_message(std::string("Acquisition size: ") + std::to_string(acq_size) + " GiB");
-	utils::log_message(std::string("Average acquisition rate: ") + std::to_string(acq_size / (static_cast<float>(time_ms) / 1e3f)) + " GiB/s");
-	utils::log_break();
-	utils::log_message(std::string("Average GetBuffer time: ") + std::to_string(times[0]) + " us");
-	utils::log_message(std::string("Average unpack time: ") + std::to_string(times[1]) + " us");
-	utils::log_message(std::string("Average operations time: ") + std::to_string(times[2]) + " us");
-	// utils::log_message(std::string("Average memcpy time: ") + std::to_string(times[3]) + " us");
-	utils::log_message(std::string("Average PostBuffer time: ") + std::to_string(times[4]) + " us");
-	utils::log_message(std::string("Average Window/Python time: ") + std::to_string(times[5]) + " us");
-	utils::log_message(std::string("Average loop time: ") + std::to_string(times[6]) + " us");
+	//utils::log_message(std::string("Buffers filled: ") + std::to_string(buffers_full));
+	//utils::log_message(std::string("Acquisition time: ") + std::to_string(time_ms) + " ms");
+	//utils::log_message(std::string("Acquisition size: ") + std::to_string(acq_size) + " GiB");
+	//utils::log_message(std::string("Average acquisition rate: ") + std::to_string(acq_size / (static_cast<float>(time_ms) / 1e3f)) + " GiB/s");
+	//utils::log_break();
+	//utils::log_message(std::string("Average GetBuffer time: ") + std::to_string(times[0]) + " us");
+	//utils::log_message(std::string("Average unpack time: ") + std::to_string(times[1]) + " us");
+	//utils::log_message(std::string("Average operations time: ") + std::to_string(times[2]) + " us");
+	//// utils::log_message(std::string("Average memcpy time: ") + std::to_string(times[3]) + " us");
+	//utils::log_message(std::string("Average PostBuffer time: ") + std::to_string(times[4]) + " us");
+	//utils::log_message(std::string("Average Window/Python time: ") + std::to_string(times[5]) + " us");
+	//utils::log_message(std::string("Average loop time: ") + std::to_string(times[6]) + " us");
 
 	buffer_thread_done = true;
 }
@@ -653,6 +676,20 @@ void Acquisition::start() {
 	std::thread window_thread = std::thread(&window_handler);
 	window_thread.detach();
 
+	//std::thread trigger_thread([&]() {
+	//	for (size_t i = 0; i < 1000000000; ++i) {
+	//		using namespace std::chrono_literals;
+	//		std::this_thread::sleep_for(1ns);
+
+	//		auto rc = AlazarForceTriggerEnable(m_alazar_board);
+	//		utils::alazar_err_handle(rc, "ALazarForceTriggerEnable failed", __FILE__, __LINE__);
+
+	//		rc = AlazarForceTrigger(m_alazar_board);
+	//		utils::alazar_err_handle(rc, "ALazarForceTrigger failed", __FILE__, __LINE__);
+	//	}
+	//});
+	//trigger_thread.detach();
+
 	// The thread that will do the work of capturing and processing the data
 	std::thread buffer_thread([&]() { buffer_handler(); });
 	buffer_thread.detach();
@@ -696,12 +733,12 @@ void Acquisition::cleanup() {
 		auto time_end = std::chrono::steady_clock::now();
 		auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(time_end - thread_time_start).count();
 
-		// Stop after all the threads are done (or give up after 30 seconds)
-		if (time_ms >= 30000 || buffer_thread_done) break;
+		// Stop after all the threads are done (or give up after 3 seconds)
+		if (time_ms >= 3000 || buffer_thread_done) break;
 
 		std::this_thread::sleep_for(100ms); // Wait a little bit for more threads to finish
 	}
-	utils::log_message(std::string("Thread finished (or timed out) in ") + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - thread_time_start).count()) + " ms\n");
+	// utils::log_message(std::string("Thread finished (or timed out) in ") + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - thread_time_start).count()) + " ms\n");
 
 	// Stop capturing data
 	if (m_did_start_capture) {
@@ -710,8 +747,11 @@ void Acquisition::cleanup() {
 	}
 
 	// Close file if we need to
-	if (m_out_file.is_open()) {
-		m_out_file.close();
+	if (m_out_file_chan_a.is_open()) {
+		m_out_file_chan_a.close();
+	}
+	if (m_out_file_chan_b.is_open()) {
+		m_out_file_chan_b.close();
 	}
 
 	// If we did not allocate any memory, we don't need to free any memory
@@ -769,6 +809,24 @@ void Acquisition::cleanup() {
 
 		// Processed data from channel A (CPU)
 		try {
+			auto cuda_rc = cudaFreeHost(m_cpu_chan_a_real_buffers[i]);
+			utils::cuda_err_handle(cuda_rc, "cudaFreeHost failed", __FILE__, __LINE__);
+		}
+		catch (std::exception& _e) {
+			failed = true;
+		}
+
+		// Processed data from channel B (CPU)
+		try {
+			auto cuda_rc = cudaFreeHost(m_cpu_chan_b_real_buffers[i]);
+			utils::cuda_err_handle(cuda_rc, "cudaFreeHost failed", __FILE__, __LINE__);
+		}
+		catch (std::exception& _e) {
+			failed = true;
+		}
+
+		// Processed data from channel A (CPU)
+		try {
 			auto cuda_rc = cudaFreeHost(m_cpu_chan_a_complex_buffers[i]);
 			utils::cuda_err_handle(cuda_rc, "cudaFreeHost failed", __FILE__, __LINE__);
 		}
@@ -804,6 +862,7 @@ void Acquisition::cleanup() {
 }
 
 bool Acquisition::is_finished() {
+	std::shared_lock lock(should_stop_acq_mutex);
 	return should_stop_acq;
 }
 
