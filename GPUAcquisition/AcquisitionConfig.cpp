@@ -150,7 +150,7 @@ AcquisitionConfig::AcquisitionConfig(py::dict config) : AcquisitionConfig::Acqui
 		set("trigger_operation", "level2", trigger_operation.level2);
 	}
 
-	if (config.contains("external_triger")) {
+	if (config.contains("external_trigger")) {
 		set("external_trigger", "coupling", external_trigger.coupling);
 		set("external_trigger", "range", external_trigger.range);
 	}
