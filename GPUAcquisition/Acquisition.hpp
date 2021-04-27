@@ -93,7 +93,8 @@ private:
 	bool m_did_start_capture;
 
 	// For writing to disk
-	std::ofstream m_out_file;
+	std::ofstream m_out_file_chan_a;
+	std::ofstream m_out_file_chan_b;
 };
 
 #endif /* __ACQUISITION_HPP__ */
